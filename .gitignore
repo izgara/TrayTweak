@@ -1,0 +1,12 @@
+# Build output
+*.exe
+*.dll
+*.obj
+*.lib
+*.exp
+*.pdb
+*.zip
+
+# Local files that describe this PC's apps
+*.log
+*.reg
