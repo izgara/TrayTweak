@@ -2,8 +2,9 @@
 //   1. Applies the tray settings chosen in TrayTweakPanel.exe.
 //   2. If an option needs it, loads TrayTweakTap.dll into the taskbar's thread in
 //      explorer.exe. Running it again is harmless: the DLL only starts once.
+//   3. Starts TrayTweakVolume.exe if the tray volume mixer is on.
 //
-// --interactive     started from the panel, so a UAC prompt may be shown if needed
+// --interactive    started from the panel, so a UAC prompt may be shown if needed
 // --elevated-setup  writes the one machine-wide value below, then exits
 #include "TrayCommon.h"
 
@@ -139,6 +140,22 @@ HWND WaitForTaskbarUi() {
     return nullptr;
 }
 
+// The mixer copes with a missing taskbar itself, so it can start before Explorer is ready.
+void StartVolumeMixer() {
+    if (!ReadSetting(kVolumeMixer) || FindWindowW(kVolumeWindowClass, nullptr)) return;
+    wchar_t exe[MAX_PATH];
+    swprintf_s(exe, L"%sTrayTweakVolume.exe", g_dir);
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    if (CreateProcessW(exe, nullptr, nullptr, nullptr, FALSE, 0, nullptr, g_dir, &startup, &process)) {
+        CloseHandle(process.hProcess);
+        CloseHandle(process.hThread);
+        Log("volume mixer started");
+    } else {
+        Log("volume mixer not started: %lu", GetLastError());
+    }
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
@@ -152,8 +169,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
 
     TrimLog();
     ApplyTraySettings();
+    StartVolumeMixer();
 
-    if (!ReadSetting(kHideVolume) && !ReadSetting(kHideMicrophone) && !ReadSetting(kHideLanguage) && !ReadSetting(kShowAllIcons)) {
+    if (!ReadSetting(kHideVolume) && !ReadSetting(kHideMicrophone) && !ReadSetting(kHideLanguage) && !ReadSetting(kShowAllIcons) &&
+        !ReadSetting(kTaskbarGlass) && !ReadSetting(kMenuGlass)) {
         Log("nothing needs the DLL");
         return 0;
     }

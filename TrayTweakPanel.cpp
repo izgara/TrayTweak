@@ -23,7 +23,7 @@ constexpr COLORREF kDarkBack = RGB(32, 32, 32);
 constexpr COLORREF kDarkText = RGB(240, 240, 240);
 constexpr UINT kLoaderFinished = WM_APP + 1;
 
-enum class OptionKind { Setting, Arrow, ShowAll, Autostart, Language };
+enum class OptionKind { Setting, Mixer, Arrow, ShowAll, Autostart, Language };
 
 struct Option {
     OptionKind kind;
@@ -34,8 +34,10 @@ struct Option {
 
 constexpr Option kOptions[] = {
     {OptionKind::Setting, kHideVolume, L"Hide the volume icon", L"Ses simgesini gizle"},
+    {OptionKind::Mixer, kVolumeMixer, L"Volume mixer in the tray, in place of the volume icon", L"Ses simgesi yerine tepside ses karıştırıcı"},
     {OptionKind::Setting, kHideMicrophone, L"Hide the microphone privacy icon", L"Mikrofon gizlilik simgesini gizle"},
     {OptionKind::Setting, kHideLanguage, L"Hide the language indicator", L"Dil göstergesini gizle"},
+    {OptionKind::Setting, kTaskbarGlass, L"Glass taskbar (frosted, or clear at 0% tint)", L"Cam görev çubuğu (buzlu, ton %0'da tamamen şeffaf)"},
     {OptionKind::Arrow, kHideArrow, L"Hide the arrow (^): hidden icons are fully gone", L"Oku (^) gizle: gizlenen simgeler tamamen kaybolur"},
     {OptionKind::ShowAll, kShowAllIcons, L"Always show icons, also for new apps", L"Simgeleri her zaman göster, yeni uygulamalar dahil"},
     {OptionKind::Autostart, nullptr, L"Start with Windows", L"Windows ile başlat"},
@@ -110,32 +112,6 @@ std::wstring ResolvePath(std::wstring const &stored) {
     if (SUCCEEDED(SHGetKnownFolderPath(folder, 0, nullptr, &base))) result = std::wstring(base) + stored.substr(close + 1);
     CoTaskMemFree(base);
     return result;
-}
-
-std::wstring FriendlyName(std::wstring const &path) {
-    DWORD handle = 0;
-    DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
-    if (size) {
-        std::vector<BYTE> data(size);
-        struct Translation {
-            WORD language, codePage;
-        } *translation = nullptr;
-        UINT length = 0;
-        if (GetFileVersionInfoW(path.c_str(), 0, size, data.data()) &&
-            VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<void **>(&translation), &length) &&
-            length >= sizeof(Translation)) {
-            wchar_t query[64];
-            swprintf_s(query, L"\\StringFileInfo\\%04x%04x\\FileDescription", translation->language, translation->codePage);
-            wchar_t *description = nullptr;
-            if (VerQueryValueW(data.data(), query, reinterpret_cast<void **>(&description), &length) && length > 1 && description[0]) {
-                return description;
-            }
-        }
-    }
-    size_t slash = path.find_last_of(L'\\');
-    std::wstring file = slash == std::wstring::npos ? path : path.substr(slash + 1);
-    size_t dot = file.find_last_of(L'.');
-    return dot == std::wstring::npos ? file : file.substr(0, dot);
 }
 
 void LoadRows() {
@@ -225,6 +201,15 @@ void ApplyOption(Option const &option, bool on) {
         case OptionKind::Setting:
             WriteSetting(option.setting, on);
             if (on) StartLoader();
+            break;
+        case OptionKind::Mixer:
+            WriteSetting(option.setting, on);
+            if (on) {
+                std::wstring exe = ModuleSibling(L"TrayTweakVolume.exe");
+                ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            } else if (HWND mixer = FindWindowW(kVolumeWindowClass, nullptr)) {
+                PostMessageW(mixer, WM_CLOSE, 0, 0);
+            }
             break;
         case OptionKind::Arrow: {
             WriteSetting(option.setting, on);
@@ -404,12 +389,6 @@ bool SystemUsesDarkApps() {
     RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme",
                  RRF_RT_REG_DWORD, nullptr, &value, &size);
     return value == 0;
-}
-
-bool UseTurkish() {
-    std::wstring language = ReadString(HKEY_CURRENT_USER, kSettingsRoot, kLanguage);
-    if (!language.empty()) return language == L"tr";
-    return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_TURKISH;
 }
 
 }  // namespace

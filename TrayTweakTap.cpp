@@ -24,6 +24,10 @@
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
+#include <winrt/Windows.UI.Xaml.Shapes.h>
+#include <winrt/Windows.UI.h>
+
+#include <commctrl.h>
 
 #include <atomic>
 #include <cstdio>
@@ -34,6 +38,7 @@ namespace wf = winrt::Windows::Foundation;
 namespace wux = winrt::Windows::UI::Xaml;
 namespace wuxc = wux::Controls;
 namespace wuxm = wux::Media;
+namespace wuxs = wux::Shapes;
 using FE = wux::FrameworkElement;
 
 namespace {
@@ -52,6 +57,13 @@ DWORD g_uiThread;
 HANDLE g_foundControlCenter;
 HANDLE g_foundMainStack;
 HANDLE g_foundLanguageStack;
+HANDLE g_foundBackground;
+std::atomic<bool> g_taskbarGlass;
+std::atomic<bool> g_menuGlass;
+std::atomic<DWORD> g_glassColor;
+std::atomic<DWORD> g_glassOpacity;
+bool g_glassHooksInstalled;
+bool g_settingFill;
 std::atomic<bool> g_hideVolume;
 std::atomic<bool> g_hideMicrophone;
 std::atomic<bool> g_hideLanguage;
@@ -76,6 +88,7 @@ struct Roots {
     winrt::weak_ref<FE> controlCenter;
     winrt::weak_ref<FE> mainStack;
     winrt::weak_ref<FE> languageStack;
+    std::vector<winrt::weak_ref<wuxs::Shape>> backgrounds;  // one per taskbar (monitor)
 };
 auto &g_roots = *new Roots();
 struct UiQueue {
@@ -315,6 +328,143 @@ void ScanControlCenter(FE const &button) {
     if (panel) UpdatePanelSpacing(panel);
 }
 
+// ---------------------------------------------------------------- glass
+// The Windows 11 taskbar paints its own XAML background over its window. Making that
+// fill transparent and asking DWM to blur behind the window gives a frosted glass
+// taskbar. The same blur is given to the Open-Shell menu, which also lives in Explorer.
+
+struct AccentPolicy {
+    int state;
+    int flags;
+    DWORD gradient;  // 0xAABBGGRR
+    int animation;
+};
+struct CompositionData {
+    int attribute;
+    void *data;
+    SIZE_T size;
+};
+// Plain blur-behind (3) renders black on the Windows 11 taskbar; acrylic (4) works.
+// With the tint at 0% the gradient mode (2) is used instead: fully clear, no blur.
+constexpr int kAccentDisabled = 0, kAccentTransparent = 2, kAccentAcrylic = 4, kWcaAccentPolicy = 19;
+
+DWORD GradientColor() {
+    DWORD rgb = g_glassColor, opacity = g_glassOpacity > 100 ? 100 : g_glassOpacity.load();
+    DWORD alpha = opacity * 255 / 100;
+    return (alpha << 24) | ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
+}
+
+void SetAccent(HWND window, bool on, DWORD gradient) {
+    using SetWca = BOOL(WINAPI *)(HWND, CompositionData *);
+    static auto set = reinterpret_cast<SetWca>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute"));
+    if (!set || !window) return;
+    int state = !on ? kAccentDisabled : (gradient >> 24) == 0 ? kAccentTransparent : kAccentAcrylic;
+    AccentPolicy policy{state, on ? 2 : 0, gradient, 0};
+    CompositionData data{kWcaAccentPolicy, &policy, sizeof(policy)};
+    set(window, &data);
+}
+
+BOOL CALLBACK ApplyToTaskbarWindow(HWND window, LPARAM) {
+    wchar_t name[64];
+    if (GetClassNameW(window, name, ARRAYSIZE(name)) &&
+        (wcscmp(name, L"Shell_TrayWnd") == 0 || wcscmp(name, L"Shell_SecondaryTrayWnd") == 0)) {
+        SetAccent(window, g_taskbarGlass, GradientColor());
+    }
+    return TRUE;
+}
+
+void ApplyTaskbarAccent() { EnumWindows(ApplyToTaskbarWindow, 0); }
+
+void ApplyFill(wuxs::Shape const &fill) {
+    g_settingFill = true;
+    if (g_taskbarGlass) {
+        fill.Fill(wuxm::SolidColorBrush(winrt::Windows::UI::Color{0, 0, 0, 0}));
+    } else {
+        fill.ClearValue(wuxs::Shape::FillProperty());
+    }
+    g_settingFill = false;
+}
+
+void ApplyGlass() {
+    auto &list = g_roots.backgrounds;
+    for (size_t i = 0; i < list.size();) {
+        if (auto fill = list[i].get()) {
+            ApplyFill(fill);
+            i++;
+        } else {
+            list.erase(list.begin() + i);
+        }
+    }
+    // Leave the window alone unless glass is on, or was on and must be undone.
+    static bool accentWasOn;
+    if (g_taskbarGlass || accentWasOn) ApplyTaskbarAccent();
+    accentWasOn = g_taskbarGlass;
+}
+
+// Explorer can redo the window's composition on theme or display changes.
+LRESULT CALLBACK TaskbarSubclass(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+    switch (message) {
+        case WM_DWMCOMPOSITIONCHANGED:
+        case WM_DWMCOLORIZATIONCOLORCHANGED:
+        case WM_THEMECHANGED:
+        case WM_SETTINGCHANGE:
+        case WM_DISPLAYCHANGE:
+            if (g_taskbarGlass) ApplyTaskbarAccent();
+            break;
+    }
+    return result;
+}
+
+void CALLBACK OnWindowShown(HWINEVENTHOOK, DWORD, HWND window, LONG object, LONG, DWORD, DWORD) {
+    if (object != OBJID_WINDOW || !window || !g_menuGlass) return;
+    wchar_t name[64];
+    if (!GetClassNameW(window, name, ARRAYSIZE(name)) || wcscmp(name, L"OpenShell.CMenuContainer") != 0) return;
+    // Open-Shell already paints its own tint, so only a faint one is added here.
+    // Acrylic with zero alpha misrenders, hence the small value; at 0% it stays clear.
+    DWORD gradient = GradientColor();
+    SetAccent(window, true, (gradient >> 24) == 0 ? 0 : (gradient & 0x00FFFFFF) | 0x10000000);
+}
+
+// Runs once on the taskbar's thread, which owns Shell_TrayWnd and pumps messages.
+void InstallGlassHooks() {
+    if (g_glassHooksInstalled) return;
+    g_glassHooksInstalled = true;
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (tray && GetWindowThreadProcessId(tray, nullptr) == GetCurrentThreadId()) {
+        SetWindowSubclass(tray, TaskbarSubclass, 1, 0);
+    } else {
+        Log("taskbar window is on another thread, no subclass");
+    }
+    if (!SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, OnWindowShown, GetCurrentProcessId(), 0, WINEVENT_OUTOFCONTEXT)) {
+        Log("menu glass hook failed: %lu", GetLastError());
+    }
+}
+
+bool IsTaskbarBackground(FE const &element) {
+    auto node = wuxm::VisualTreeHelper::GetParent(element);
+    for (int i = 0; node && i < 4; i++) {
+        if (winrt::get_class_name(node) == L"Taskbar.TaskbarBackground") return true;
+        node = wuxm::VisualTreeHelper::GetParent(node);
+    }
+    return false;
+}
+
+void TrackBackground(wuxs::Shape const &fill) {
+    for (auto const &weak : g_roots.backgrounds) {
+        if (auto existing = weak.get(); existing && winrt::get_abi(existing) == winrt::get_abi(fill)) return;
+    }
+    g_roots.backgrounds.push_back(winrt::make_weak(fill));
+    // Explorer restyles the fill on theme changes; put the transparent one back.
+    fill.RegisterPropertyChangedCallback(wuxs::Shape::FillProperty(), [](wux::DependencyObject const &sender, wux::DependencyProperty const &) {
+        if (g_settingFill || !g_taskbarGlass) return;
+        if (auto shape = sender.try_as<wuxs::Shape>()) ApplyFill(shape);
+    });
+    if (g_taskbarGlass || g_menuGlass) InstallGlassHooks();
+    if (g_taskbarGlass) ApplyGlass();
+    Log("taskbar background found (%u)", (unsigned)g_roots.backgrounds.size());
+}
+
 void StartAdvise();
 
 void AttachHandlers(FE const &element, ScanFn scan, const char *name) {
@@ -388,6 +538,12 @@ public:
                 AttachHandlers(frameworkElement, &ScanLanguageStack, "language stack");
                 ScanGuarded(frameworkElement, &ScanLanguageStack);
                 SetEvent(g_foundLanguageStack);
+            } else if ((name == L"BackgroundFill" || name == L"BackgroundStroke") && IsTaskbarBackground(frameworkElement)) {
+                // The stroke is the thin line along the top edge of the taskbar.
+                if (auto shape = frameworkElement.try_as<wuxs::Shape>()) {
+                    TrackBackground(shape);
+                    SetEvent(g_foundBackground);
+                }
             }
         } catch (...) {
             Log("OnVisualTreeChange failed: %08X", winrt::to_hresult().value);
@@ -417,6 +573,7 @@ DWORD WINAPI AdviseThread(void *) {
             WaitForSingleObject(g_foundControlCenter, INFINITE);
             if (WaitForSingleObject(g_foundMainStack, 5000) != WAIT_OBJECT_0) Log("main stack not found");
             if (WaitForSingleObject(g_foundLanguageStack, 5000) != WAIT_OBJECT_0) Log("language stack not found");
+            if (WaitForSingleObject(g_foundBackground, 5000) != WAIT_OBJECT_0) Log("taskbar background not found");
             hr = visualTree->UnadviseVisualTreeChange(g_watcher);
             Log("diagnostics disconnected: %08X", hr);
             if (g_uiQueue) {
@@ -446,6 +603,7 @@ void StartAdvise() {
     ResetEvent(g_foundControlCenter);
     ResetEvent(g_foundMainStack);
     ResetEvent(g_foundLanguageStack);
+    ResetEvent(g_foundBackground);
     HANDLE thread = CreateThread(nullptr, 0, AdviseThread, nullptr, 0, nullptr);
     if (thread) {
         CloseHandle(thread);
@@ -496,42 +654,51 @@ public:
     HRESULT STDMETHODCALLTYPE LockServer(BOOL) noexcept override { return S_OK; }
 };
 
-// Two registry waits. Neither uses a thread of its own while idle.
+// Two registry watches served by one thread that only ever sleeps in a wait. Thread
+// pool waits were tried first, but their registrations were silently lost after a
+// while, so settings changes stopped arriving.
 struct RegistryWatch {
     HKEY key = nullptr;
     HANDLE event = nullptr;
-    void *volatile wait = nullptr;
     DWORD filter = 0;
     void (*onChange)() = nullptr;
 };
 RegistryWatch g_trayWatch;
 RegistryWatch g_settingsWatch;
 
-VOID CALLBACK OnRegistryChanged(PVOID parameter, BOOLEAN);
-
-void ArmWatch(RegistryWatch &watch) {
-    LSTATUS status = RegNotifyChangeKeyValue(watch.key, FALSE, watch.filter | REG_NOTIFY_THREAD_AGNOSTIC, watch.event, TRUE);
-    if (status != ERROR_SUCCESS) {
-        Log("registry watch failed: %ld", status);
-        return;
-    }
-    HANDLE wait = nullptr;
-    if (RegisterWaitForSingleObject(&wait, watch.event, OnRegistryChanged, &watch, INFINITE, WT_EXECUTEONLYONCE)) {
-        InterlockedExchangePointer(const_cast<void **>(&watch.wait), wait);
-    } else {
-        Log("registry wait failed: %lu", GetLastError());
-    }
+bool ArmWatch(RegistryWatch &watch) {
+    if (!watch.key || !watch.event) return false;
+    LSTATUS status = RegNotifyChangeKeyValue(watch.key, FALSE, watch.filter, watch.event, TRUE);
+    if (status != ERROR_SUCCESS) Log("registry watch failed: %ld", status);
+    return status == ERROR_SUCCESS;
 }
 
-VOID CALLBACK OnRegistryChanged(PVOID parameter, BOOLEAN) {
-    auto &watch = *static_cast<RegistryWatch *>(parameter);
-    if (void *previous = InterlockedExchangePointer(const_cast<void **>(&watch.wait), nullptr)) UnregisterWait(previous);
-    // Rearm first so that a change during the work below isn't missed.
-    ArmWatch(watch);
-    try {
-        watch.onChange();
-    } catch (...) {
-        Log("registry change handler failed");
+DWORD WINAPI WatchThread(void *) {
+    RegistryWatch *watches[] = {&g_settingsWatch, &g_trayWatch};
+    HANDLE events[2];
+    DWORD count = 0;
+    RegistryWatch *armed[2];
+    for (auto *watch : watches) {
+        if (ArmWatch(*watch)) {
+            armed[count] = watch;
+            events[count++] = watch->event;
+        }
+    }
+    if (!count) return 0;
+    for (;;) {
+        DWORD result = WaitForMultipleObjects(count, events, FALSE, INFINITE);
+        if (result >= WAIT_OBJECT_0 + count) {
+            Log("registry watch thread stopped: %lu", GetLastError());
+            return 0;
+        }
+        auto &watch = *armed[result - WAIT_OBJECT_0];
+        // Rearm first, on this same thread, so a change during the work isn't missed.
+        ArmWatch(watch);
+        try {
+            watch.onChange();
+        } catch (...) {
+            Log("registry change handler failed");
+        }
     }
 }
 
@@ -570,6 +737,10 @@ void LoadSettings() {
     g_hideMicrophone = ReadSetting(kHideMicrophone);
     g_hideLanguage = ReadSetting(kHideLanguage);
     g_showAllIcons = ReadSetting(kShowAllIcons);
+    g_taskbarGlass = ReadSetting(kTaskbarGlass);
+    g_menuGlass = ReadSetting(kMenuGlass);
+    g_glassColor = ReadSettingDword(kGlassColor, kDefaultGlassColor) & 0xFFFFFF;
+    g_glassOpacity = ReadSettingDword(kGlassOpacity, kDefaultGlassOpacity);
 }
 
 void RescanAll() {
@@ -586,7 +757,17 @@ void RescanAll() {
 void OnSettingsChanged() {
     LoadSettings();
     Log("settings: volume=%d microphone=%d language=%d showAll=%d", (int)g_hideVolume, (int)g_hideMicrophone, (int)g_hideLanguage, (int)g_showAllIcons);
-    if (g_uiQueue) g_uiQueue->queue.TryEnqueue([] { RescanAll(); });
+    if (g_uiQueue) {
+        g_uiQueue->queue.TryEnqueue([] {
+            RescanAll();
+            try {
+                if (g_taskbarGlass || g_menuGlass) InstallGlassHooks();
+                ApplyGlass();
+            } catch (...) {
+                Log("glass update failed");
+            }
+        });
+    }
 }
 
 void StartWatches() {
@@ -596,26 +777,41 @@ void StartWatches() {
     g_settingsWatch.onChange = &OnSettingsChanged;
     g_settingsWatch.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsRoot, 0, nullptr, 0, KEY_READ | KEY_NOTIFY, nullptr, &g_settingsWatch.key, nullptr);
-    if (status == ERROR_SUCCESS && g_settingsWatch.event) {
-        ArmWatch(g_settingsWatch);
-    } else {
-        Log("settings watch not started: %ld", status);
-    }
+    if (status != ERROR_SUCCESS || !g_settingsWatch.event) Log("settings watch not started: %ld", status);
 
     g_trayWatch.filter = REG_NOTIFY_CHANGE_NAME;
     g_trayWatch.onChange = &OnTrayEntriesChanged;
     g_trayWatch.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     status = RegOpenKeyExW(HKEY_CURRENT_USER, kTrayRoot, 0, KEY_READ | KEY_SET_VALUE | KEY_NOTIFY, &g_trayWatch.key);
     if (status == ERROR_SUCCESS && g_trayWatch.event) {
-        ArmWatch(g_trayWatch);
         try {
             ApplyToNewEntries();
         } catch (...) {
             Log("ApplyToNewEntries failed");
         }
     } else {
+        g_trayWatch.key = nullptr;
         Log("tray watch not started: %ld", status);
     }
+    HANDLE thread = CreateThread(nullptr, 0, WatchThread, nullptr, 0, nullptr);
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        Log("watch thread not started: %lu", GetLastError());
+    }
+}
+
+// Running TrayTweak.exe again puts everything back, e.g. after another tool reset the taskbar.
+void ReapplyAll() {
+    LoadSettings();
+    RescanAll();
+    try {
+        if (g_taskbarGlass || g_menuGlass) InstallGlassHooks();
+        ApplyGlass();
+    } catch (...) {
+        Log("glass update failed");
+    }
+    Log("reapplied");
 }
 
 DWORD WINAPI BootstrapThread(void *) {
@@ -647,7 +843,9 @@ extern "C" LRESULT CALLBACK HookProc(int code, WPARAM wParam, LPARAM lParam) {
     static const UINT message = RegisterWindowMessageW(L"TrayTweak.Start");
     if (code == HC_ACTION && reinterpret_cast<CWPSTRUCT *>(lParam)->message == message) {
         if (g_started.exchange(true)) {
-            SignalReady();  // Already running in this Explorer.
+            // Already running in this Explorer. This is the taskbar's thread, so XAML can be touched.
+            if (GetCurrentThreadId() == g_uiThread) ReapplyAll();
+            SignalReady();
         } else {
             // Stay loaded after the loader exits and removes its hook.
             HMODULE self;
@@ -657,6 +855,7 @@ extern "C" LRESULT CALLBACK HookProc(int code, WPARAM wParam, LPARAM lParam) {
             g_foundControlCenter = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             g_foundMainStack = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             g_foundLanguageStack = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            g_foundBackground = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             HANDLE thread = CreateThread(nullptr, 0, BootstrapThread, nullptr, 0, nullptr);
             if (thread) CloseHandle(thread);
         }

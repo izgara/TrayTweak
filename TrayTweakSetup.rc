@@ -1,0 +1,6 @@
+// Files embedded in TrayTweakSetup.exe. Ids match kFiles in TrayTweakSetup.cpp.
+101 RCDATA "TrayTweak.exe"
+102 RCDATA "TrayTweakPanel.exe"
+103 RCDATA "TrayTweakTap.dll"
+104 RCDATA "TrayTweakVolume.exe"
+105 RCDATA "LICENSE"
