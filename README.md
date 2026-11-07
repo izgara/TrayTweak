@@ -79,7 +79,8 @@ inside `dwm.exe`.
   and from then on holds only a few XAML event handlers, one thread that sleeps until a setting
   or tray entry changes, and for the glass option a window subclass and an event hook. It has
   no timer and doesn't load into any other process.
-- If Explorer restarts, everything comes back until `TrayTweak.exe` runs again.
+- If Explorer restarts, the volume mixer notices and runs `TrayTweak.exe` again, so everything
+  comes back by itself. Without the mixer, it stays gone until `TrayTweak.exe` runs again.
 - It uses no network.
 
 Settings are stored in `HKCU\Software\TrayTweak`. It also changes these values:

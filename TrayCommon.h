@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-constexpr wchar_t kVersion[] = L"1.1.0";
+constexpr wchar_t kVersion[] = L"1.1.1";
 constexpr wchar_t kTrayRoot[] = L"Control Panel\\NotifyIconSettings";
 constexpr wchar_t kSettingsRoot[] = L"Software\\TrayTweak";
 constexpr wchar_t kArrowKey[] = L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\TrayNotify";

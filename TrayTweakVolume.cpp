@@ -32,6 +32,7 @@ constexpr UINT kVolumeChanged = WM_APP + 2;
 constexpr UINT kDeviceChanged = WM_APP + 3;
 constexpr UINT_PTR kMeterTimer = 1;
 constexpr UINT_PTR kScanTimer = 2;
+constexpr UINT_PTR kReapplyTimer = 3;
 constexpr UINT kDeviceMenuBase = 100;
 
 // Segoe Fluent Icons code points (numeric on purpose, see README build notes).
@@ -905,6 +906,10 @@ void ShowMenu(POINT at, bool fromFlyout) {
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == g_taskbarCreated && g_taskbarCreated) {
+        // An icon that was already up means Explorer restarted, which also dropped
+        // TrayTweak's tweaks. TrayTweak.exe puts them back once the new taskbar is ready;
+        // the timer folds several of these messages into one run.
+        if (g_iconAdded) SetTimer(window, kReapplyTimer, 2000, nullptr);
         UpdateTray(true);
         return 0;
     }
@@ -946,6 +951,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 InvalidateRect(window, nullptr, FALSE);
             } else if (wParam == kScanTimer && g_dragRow < 0) {
                 Rescan();
+            } else if (wParam == kReapplyTimer) {
+                KillTimer(window, kReapplyTimer);
+                std::wstring exe = ModuleSibling(L"TrayTweak.exe");
+                std::wstring dir = exe.substr(0, exe.find_last_of(L'\\'));
+                ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr, dir.c_str(), SW_SHOWNORMAL);
             }
             return 0;
         case WM_PAINT: {
